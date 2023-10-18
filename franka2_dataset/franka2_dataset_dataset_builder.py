@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
 import tensorflow_datasets as tfds
-from bridge_dataset.conversion_utils import MultiThreadedDatasetBuilder
+from franka2_dataset.conversion_utils import MultiThreadedDatasetBuilder
 
 
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
@@ -16,40 +16,38 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 
     def _parse_examples(episode_path):
         # load raw data --> this should change for your dataset
-        data = np.load(episode_path, allow_pickle=True)  # this is a list of dicts in our case
+        # data = np.load(episode_path, allow_pickle=True)  # this is a list of dicts in our case
+
+        with tf.io.gfile.GFile(episode_path, 'rb') as f:
+            data = np.load(f, allow_pickle=True)
+
+        task_name = episode_path.split('/')[-1][:-4]
+        print("task name: ", task_name)
 
         for k, example in enumerate(data):
             # assemble episode --> here we're assuming demos so we set reward to 1 at the end
             episode = []
 
-            instruction = example['language'][0]
-            if instruction:
-                language_embedding = _embed([instruction])[0].numpy()
-            else:
-                language_embedding = np.zeros(512, dtype=np.float32)
-
             for i in range(len(example['observations'])):
                 observation = {
                     'state': example['observations'][i]['state'].astype(np.float32),
                 }
-                for image_idx in range(4):
-                    orig_key = f'images{image_idx}'
-                    new_key = f'image_{image_idx}'
-                    if orig_key in example['observations'][i]:
-                        observation[new_key] = example['observations'][i][orig_key]
-                    else:
-                        observation[new_key] = np.zeros_like(example['observations'][i]['images0'])
+                # orig_key = f'image'
+                # new_key = f'image_0'
+                # observation['image'] = example['observations'][i][orig_key]
+
+                observation['image'] = example['observations'][i]['image']
+
+                primitive = example['primitives'][i]
 
                 episode.append({
                     'observation': observation,
                     'action': example['actions'][i].astype(np.float32),
-                    'discount': 1.0,
-                    'reward': float(i == (len(example['observations']) - 1)),
                     'is_first': i == 0,
                     'is_last': i == (len(example['observations']) - 1),
                     'is_terminal': i == (len(example['observations']) - 1),
-                    'language_instruction': instruction,
-                    'language_embedding': language_embedding,
+                    'language_instruction': task_name,
+                    'primitive': primitive,
                 })
 
             # create output data sample
@@ -60,13 +58,12 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'episode_id': k,
                 }
             }
+            
+            # orig_key = f'image'
+            # new_key = f'image_0'
 
-            # mark dummy values
-            for image_idx in range(4):
-                orig_key = f'images{image_idx}'
-                new_key = f'image_{image_idx}'
-                sample['episode_metadata'][f'has_{new_key}'] = orig_key in example['observations']
-            sample['episode_metadata']['has_language'] = bool(instruction)
+            sample['episode_metadata'][f'has_image'] = True
+            sample['episode_metadata']['has_language'] = True
 
             # if you want to skip an example for whatever reason, simply return None
             yield episode_path + str(k), sample
@@ -77,7 +74,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             yield id, sample
 
 
-class BridgeDataset(MultiThreadedDatasetBuilder):
+class Franka2Dataset(MultiThreadedDatasetBuilder):
     """DatasetBuilder for example dataset."""
 
     VERSION = tfds.core.Version('1.0.0')
@@ -96,35 +93,16 @@ class BridgeDataset(MultiThreadedDatasetBuilder):
             features=tfds.features.FeaturesDict({
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
-                        'image_0': tfds.features.Image(
-                            shape=(256, 256, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Main camera RGB observation.',
-                        ),
-                        'image_1': tfds.features.Image(
-                            shape=(256, 256, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Main camera RGB observation.',
-                        ),
-                        'image_2': tfds.features.Image(
-                            shape=(256, 256, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Main camera RGB observation.',
-                        ),
-                        'image_3': tfds.features.Image(
-                            shape=(256, 256, 3),
+                        'image': tfds.features.Image(
+                            shape=(128, 128, 3),
                             dtype=np.uint8,
                             encoding_format='jpeg',
                             doc='Main camera RGB observation.',
                         ),
                         'state': tfds.features.Tensor(
-                            shape=(7,),
+                            shape=(8,),
                             dtype=np.float32,
-                            doc='Robot state, consists of [7x robot joint angles, '
-                                '2x gripper position, 1x door opening angle].',
+                            doc='Robot state'
                         )
                     }),
                     'action': tfds.features.Tensor(
@@ -132,14 +110,6 @@ class BridgeDataset(MultiThreadedDatasetBuilder):
                         dtype=np.float32,
                         doc='Robot action, consists of [7x joint velocities, '
                             '2x gripper velocities, 1x terminate episode].',
-                    ),
-                    'discount': tfds.features.Scalar(
-                        dtype=np.float32,
-                        doc='Discount if provided, default to 1.'
-                    ),
-                    'reward': tfds.features.Scalar(
-                        dtype=np.float32,
-                        doc='Reward if provided, 1 on final step for demos.'
                     ),
                     'is_first': tfds.features.Scalar(
                         dtype=np.bool_,
@@ -156,11 +126,8 @@ class BridgeDataset(MultiThreadedDatasetBuilder):
                     'language_instruction': tfds.features.Text(
                         doc='Language Instruction.'
                     ),
-                    'language_embedding': tfds.features.Tensor(
-                        shape=(512,),
-                        dtype=np.float32,
-                        doc='Kona language embedding. '
-                            'See https://tfhub.dev/google/universal-sentence-encoder-large/5'
+                    'primitive': tfds.features.Text(
+                        doc='what phase the task is currently in (pick, grasp, etc)'
                     ),
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
@@ -171,21 +138,9 @@ class BridgeDataset(MultiThreadedDatasetBuilder):
                         dtype=np.int32,
                         doc='ID of episode in file_path.'
                     ),
-                    'has_image_0': tfds.features.Scalar(
+                    'has_image': tfds.features.Scalar(
                         dtype=np.bool_,
                         doc='True if image0 exists in observation, otherwise dummy value.'
-                    ),
-                    'has_image_1': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True if image1 exists in observation, otherwise dummy value.'
-                    ),
-                    'has_image_2': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True if image2 exists in observation, otherwise dummy value.'
-                    ),
-                    'has_image_3': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True if image3 exists in observation, otherwise dummy value.'
                     ),
                     'has_language': tfds.features.Scalar(
                         dtype=np.bool_,
@@ -196,14 +151,12 @@ class BridgeDataset(MultiThreadedDatasetBuilder):
 
     def _split_paths(self):
         """Define filepaths for data splits."""
-        base_paths = ["/nfs/kun2/users/homer/datasets/bridge_data_all/numpy_256",
-                      "/nfs/kun2/users/homer/datasets/bridge_data_all/scripted_numpy_256"]
+        base_path = "gs://multi-robot-bucket/multi_domain_data/franka2"
         train_filenames, val_filenames = [], []
-        for path in base_paths:
-          for filename in glob.glob(f'{path}/**/*.npy', recursive=True):
-            if '/train/out.npy' in filename:
+        for filename in tf.io.gfile.glob(f'{base_path}/**/**/*.npy'):
+            if 'train' in filename:
                 train_filenames.append(filename)
-            elif '/val/out.npy' in filename:
+            elif 'val' in filename:
                 val_filenames.append(filename)
             else:
                 raise ValueError(filename)
